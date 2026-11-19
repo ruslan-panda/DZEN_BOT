@@ -1362,8 +1362,11 @@ def generate_standalone_tg_news(vetted_news: list[dict], used_topics: list[str])
 
 
 # ======================================================================
-# ВИЗУАЛЬНЫЙ ДВИЖОК (FLUX -> ПОИСК -> АРТ + ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА НА CDN)
+# ВИЗУАЛЬНЫЙ ДВИЖОК (ПОИСК ФОТО -> FLUX -> ВАРИАТИВНЫЙ АРТ + CDN)
 # ======================================================================
+import random
+
+
 def validate_and_convert_image(raw_bytes: bytes) -> bytes | None:
     if not raw_bytes or len(raw_bytes) < 12_000:
         return None
@@ -1383,13 +1386,17 @@ def validate_and_convert_image(raw_bytes: bytes) -> bytes | None:
 
 
 def render_clean_financial_artwork() -> bytes:
-    """Резервная чистая обложка 1280x720 в стиле финансовой аналитики без текста."""
+    """Резервная чистая обложка 1280x720 без текста со случайной палитрой и графиком."""
+    palettes = [
+        ((11, 24, 48), (24, 56, 102), (242, 194, 72), (64, 214, 156)),
+        ((14, 42, 36), (28, 84, 70), (110, 232, 175), (245, 204, 92)),
+        ((32, 20, 56), (68, 42, 112), (242, 175, 88), (112, 214, 255)),
+        ((20, 28, 44), (48, 66, 98), (96, 185, 245), (245, 198, 78)),
+        ((38, 22, 28), (82, 42, 54), (245, 188, 92), (104, 224, 178)),
+    ]
+    bg_top, bg_bottom, accent, highlight = random.choice(palettes)
     width, height = 1280, 720
-    bg_top = (11, 24, 48)
-    bg_bottom = (24, 56, 102)
-    gold = (242, 194, 72)
-    emerald = (64, 214, 156)
-    grid_col = (34, 68, 118)
+    grid_col = tuple(min(255, c + 24) for c in bg_top)
 
     img = Image.new("RGB", (width, height), bg_top)
     draw = ImageDraw.Draw(img)
@@ -1406,37 +1413,90 @@ def render_clean_financial_artwork() -> bytes:
     for y in range(110, height - 70, 100):
         draw.line([(100, y), (width - 100, y)], fill=grid_col, width=1)
 
-    bars = [130, 175, 150, 220, 260, 240, 315, 380]
+    bars = [random.randint(110, 210) + idx * random.randint(18, 32) for idx in range(8)]
+    bars = [min(420, b) for b in bars]
+    trend_points: list[tuple[int, int]] = []
+
     for idx, bh in enumerate(bars):
         bx0 = 180 + idx * 120
         bx1 = bx0 + 64
         by1 = 600
         by0 = by1 - bh
-        bar_color = (28, 72, 130) if idx < len(bars) - 1 else (42, 104, 176)
+        bar_color = tuple(min(255, c + (38 if idx == len(bars) - 1 else 20)) for c in bg_bottom)
         draw.rounded_rectangle([bx0, by0, bx1, by1], radius=10, fill=bar_color)
+        trend_points.append((bx0 + 32, max(120, by0 - random.randint(10, 45))))
 
-    trend_points = [
-        (212, 470),
-        (332, 425),
-        (452, 445),
-        (572, 370),
-        (692, 330),
-        (812, 345),
-        (932, 265),
-        (1052, 185),
-    ]
-    draw.line(trend_points, fill=gold, width=7)
+    draw.line(trend_points, fill=accent, width=7)
     for idx, (px, py) in enumerate(trend_points):
-        dot_color = emerald if idx == len(trend_points) - 1 else gold
+        dot_color = highlight if idx == len(trend_points) - 1 else accent
         radius = 13 if idx == len(trend_points) - 1 else 9
         draw.ellipse((px - radius - 4, py - radius - 4, px + radius + 4, py + radius + 4), fill=bg_top)
         draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=dot_color)
 
-    draw.rounded_rectangle([64, 54, width - 64, height - 54], radius=24, outline=gold, width=3)
+    draw.rounded_rectangle([64, 54, width - 64, height - 54], radius=24, outline=accent, width=3)
 
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=93)
     return out.getvalue()
+
+
+def _search_real_photo(query_ru: str, prompt_en: str) -> tuple[bytes, str] | None:
+    """Ищет уникальную тематическую фотографию (Bing Images -> Wikimedia Commons)."""
+    # 1. Bing Images (отлично работает без прокси с GitHub Actions)
+    try:
+        search_url = f"https://www.bing.com/images/search?q={quote(query_ru)}&form=HDRSC2&first=1"
+        resp = HTTP_DIRECT.get(search_url, timeout=(5, 8))
+        if resp.status_code == 200:
+            urls = re.findall(
+                r'murl(?:"|")\s*:\s*(?:"|")(https?://[^"&]+?\.(?:jpg|jpeg|png)(?:\?[^"&]*)?)(?:"|")',
+                resp.text,
+                flags=re.IGNORECASE,
+            )
+            candidates = list(dict.fromkeys(urls[:10]))
+            random.shuffle(candidates)
+            for candidate_url in candidates[:6]:
+                try:
+                    img_resp = HTTP_DIRECT.get(candidate_url, timeout=(4, 7))
+                    if img_resp.status_code == 200:
+                        valid = validate_and_convert_image(img_resp.content)
+                        if valid:
+                            return valid, candidate_url
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # 2. Wikimedia Commons (надёжный международный архив без блокировок)
+    try:
+        wiki_q = " ".join(re.findall(r"[A-Za-z]{4,}", prompt_en)[:4]) or "finance banking economy"
+        api_url = (
+            "https://commons.wikimedia.org/w/api.php"
+            f"?action=query&generator=search&gsrsearch=filetype:bitmap+{quote(wiki_q)}"
+            "&gsrlimit=10&prop=imageinfo&iiprop=url&iiurlwidth=1280&format=json"
+        )
+        resp = HTTP_DIRECT.get(api_url, timeout=(5, 8))
+        if resp.status_code == 200:
+            pages = list(resp.json().get("query", {}).get("pages", {}).values())
+            random.shuffle(pages)
+            for page in pages[:6]:
+                ii = page.get("imageinfo", [])
+                if not ii:
+                    continue
+                img_url = ii[0].get("thumburl") or ii[0].get("url")
+                if not img_url or not img_url.lower().endswith((".jpg", ".jpeg", ".png")):
+                    continue
+                try:
+                    img_resp = HTTP_DIRECT.get(img_url, timeout=(4, 7))
+                    if img_resp.status_code == 200:
+                        valid = validate_and_convert_image(img_resp.content)
+                        if valid:
+                            return valid, img_url
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return None
 
 
 def _upload_freeimage(session: requests.Session, jpeg_bytes: bytes) -> str | None:
@@ -1496,10 +1556,6 @@ def _upload_litterbox(session: requests.Session, jpeg_bytes: bytes, filename: st
 
 
 def upload_image_to_public_host_parallel(jpeg_bytes: bytes, filename: str = "cover.jpg") -> str | None:
-    """
-    Параллельно грузит JPEG на 4 CDN (сначала напрямую без медленного прокси,
-    затем через прокси). Возвращает первый успешный прямой URL.
-    """
     tasks = [
         lambda: _upload_freeimage(HTTP_DIRECT, jpeg_bytes),
         lambda: _upload_catbox(HTTP_DIRECT, jpeg_bytes, filename),
@@ -1524,11 +1580,17 @@ def upload_image_to_public_host_parallel(jpeg_bytes: bytes, filename: str = "cov
 
 def prepare_single_cover_image(meta: dict) -> tuple[bytes, str]:
     """
-    Готовит ОДНУ чистую тематическую обложку (1280x720) без текста:
-    1) AI-генерация (Flux / Pollinations) с сохранением прямого URL;
-    2) Резервный графический арт без текста (Pillow);
-    3) Параллельная выгрузка на быстрые CDN, чтобы у Дзена 100% была обложка.
+    Готовит уникальную обложку 1280x720:
+    1) Реальное фото по теме статьи (Bing Images / Wikimedia Commons);
+    2) AI-генерация (Flux / Pollinations, без текста);
+    3) Вариативный финансовый арт без текста (Pillow).
     """
+    query_ru = (
+        meta.get("cover_search_ru")
+        or meta.get("chosen_topic")
+        or meta.get("article_title")
+        or "экономика финансы деньги"
+    )
     prompt_en = meta.get(
         "cover_prompt_en",
         "Modern 3D editorial financial illustration, banking vault and growth chart, dark navy and gold, no text, no letters, 8k",
@@ -1536,23 +1598,29 @@ def prepare_single_cover_image(meta: dict) -> tuple[bytes, str]:
 
     jpeg_bytes: bytes | None = None
     direct_url: str = ""
-    origin_label = "графический арт (без текста)"
+    origin_label = "вариативный арт (без текста)"
 
-    styled_prompt = (
-        f"{prompt_en}, minimalist editorial magazine cover art, clean composition, "
-        "no text, no words, no letters, no numbers, no watermark"
-    )
-    encoded_prompt = quote(styled_prompt[:280])
-    seed = int(datetime.now().timestamp())
+    # Уровень 1: Реальная тематическая фотография из сети
+    found_photo = _search_real_photo(query_ru, prompt_en)
+    if found_photo:
+        jpeg_bytes, direct_url = found_photo
+        origin_label = "реальное фото из сети"
 
-    for model_q in ("&model=flux", ""):
-        ai_url = (
-            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-            f"?width=1280&height=720&nologo=true&seed={seed}{model_q}"
+    # Уровень 2: AI-генерация (Flux / Pollinations)
+    if not jpeg_bytes:
+        styled_prompt = (
+            f"{prompt_en}, minimalist editorial magazine cover art, clean composition, "
+            "no text, no words, no letters, no numbers, no watermark"
         )
-        for sess in (HTTP_DIRECT, HTTP) if PROXY_URL else (HTTP_DIRECT,):
+        encoded_prompt = quote(styled_prompt[:280])
+        seed = random.randint(10000, 99999999)
+        for model_q in ("&model=flux", ""):
+            ai_url = (
+                f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+                f"?width=1280&height=720&nologo=true&seed={seed}{model_q}"
+            )
             try:
-                resp = sess.get(ai_url, timeout=(8, 25))
+                resp = HTTP_DIRECT.get(ai_url, timeout=(8, 25))
                 if resp.status_code == 200:
                     valid = validate_and_convert_image(resp.content)
                     if valid:
@@ -1562,9 +1630,8 @@ def prepare_single_cover_image(meta: dict) -> tuple[bytes, str]:
                         break
             except Exception:
                 continue
-        if jpeg_bytes:
-            break
 
+    # Уровень 3: Вариативный графический арт без текста (Pillow)
     if not jpeg_bytes:
         jpeg_bytes = render_clean_financial_artwork()
 
@@ -1589,7 +1656,6 @@ def prepare_single_cover_image(meta: dict) -> tuple[bytes, str]:
         final_url[:75] if final_url else "локальный буфер",
     )
     return jpeg_bytes, final_url
-
 
 # ----------------- СБОРКА ЛОКАЛЬНОГО DOCX -----------------
 def add_formatted_paragraph(doc: Document, text: str, is_bullet: bool = False):
